@@ -2,22 +2,29 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import sqlite3
 import uuid
+import hashlib
+from datetime import datetime, timezone
 from typing import Any
 
 from flask import (
     Flask,
     abort,
+    current_app,
     jsonify,
     redirect,
     render_template,
     request,
+    send_file,
     url_for,
 )
 
 from database import close_db, get_db, init_db, loads_conclusion, now_iso
+from evidence import EvidenceError, build_evidence_bundle
 from verifier import (
     TABLE_QC,
     TABLE_WAREHOUSE,
@@ -317,6 +324,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             "supplements": supplements,
             "conclusion": conclusion,
             "history": history,
+            "credentials": list_credentials(case_id),
         }
 
     def recent_cases(limit: int = 20):
@@ -513,6 +521,147 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             raise
         return get_detail(case_id), False
 
+    def list_credentials(case_id: str) -> list[dict[str, Any]]:
+        """Return credential metadata (never the blob) for the case page."""
+        return [
+            dict(row)
+            for row in get_db()
+            .execute(
+                """
+                SELECT id, case_id, conclusion_id, package_sha256,
+                       manifest_sha256, created_at
+                FROM credentials
+                WHERE case_id = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (case_id,),
+            )
+            .fetchall()
+        ]
+
+    def _new_credential_id() -> str:
+        date_part = datetime.now(timezone.utc).strftime("%Y%m%d")
+        return f"CR-{date_part}-{uuid.uuid4().hex[:8].upper()}"
+
+    def create_credential_service(case_id: str) -> dict[str, Any]:
+        """Freeze one immutable evidence bundle inside a single SQLite snapshot.
+
+        A dedicated autocommit connection runs ``BEGIN IMMEDIATE`` so every read
+        (case, accepted supplements, conclusion version) and the final bundle
+        insert share one serialised write transaction. A supplement committed
+        concurrently is therefore either fully before or fully after this
+        snapshot, never interleaved. Any packaging or write failure rolls the
+        whole transaction back and leaves no half package behind.
+        """
+        connection = sqlite3.connect(
+            current_app.config["DATABASE_PATH"], timeout=30
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+
+            case_row = connection.execute(
+                "SELECT * FROM cases WHERE id = ?", (case_id,)
+            ).fetchone()
+            if case_row is None:
+                connection.rollback()
+                abort(404)
+            case = dict(case_row)
+
+            if not case.get("current_conclusion_id"):
+                connection.rollback()
+                raise VerificationError("案例尚无结论版本，无法生成核查凭据")
+
+            conclusion_row = connection.execute(
+                "SELECT * FROM conclusions WHERE id = ? AND case_id = ?",
+                (case["current_conclusion_id"], case_id),
+            ).fetchone()
+            if conclusion_row is None:
+                connection.rollback()
+                raise VerificationError("当前结论版本缺失，无法生成核查凭据")
+
+            supplement_rows = connection.execute(
+                "SELECT * FROM supplements WHERE case_id = ? ORDER BY id",
+                (case_id,),
+            ).fetchall()
+            supplements_snapshot = [dict(row) for row in supplement_rows]
+            conclusion_snapshot = loads_conclusion(conclusion_row)
+            generated_at = now_iso()
+
+            # Build the whole ZIP before inserting anything: a failure here
+            # still allows a clean rollback with no credential row written.
+            bundle, package_sha256, manifest_text = build_evidence_bundle(
+                case_id=case_id,
+                box_code=case["box_code"],
+                warehouse_filename=case["warehouse_filename"],
+                qc_filename=case["qc_filename"],
+                warehouse_csv=case["raw_warehouse_csv"] or "",
+                qc_csv=case["raw_qc_csv"] or "",
+                supplements=supplements_snapshot,
+                conclusion=conclusion_snapshot,
+                generated_at=generated_at,
+            )
+            manifest_sha256 = hashlib.sha256(
+                manifest_text.encode("utf-8")
+            ).hexdigest()
+            credential_id = _new_credential_id()
+
+            connection.execute(
+                """
+                INSERT INTO credentials (
+                    id, case_id, conclusion_id, package_sha256,
+                    manifest_sha256, manifest_text, bundle_blob, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    credential_id,
+                    case_id,
+                    conclusion_row["id"],
+                    package_sha256,
+                    manifest_sha256,
+                    manifest_text,
+                    sqlite3.Binary(bundle),
+                    generated_at,
+                ),
+            )
+            connection.commit()
+        except sqlite3.IntegrityError:
+            # Extremely unlikely credential-number collision: nothing is saved.
+            connection.rollback()
+            raise VerificationError("凭据编号冲突，请重新生成")
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+        return {
+            "id": credential_id,
+            "case_id": case_id,
+            "conclusion_id": conclusion_row["id"],
+            "package_sha256": package_sha256,
+            "manifest_sha256": manifest_sha256,
+            "created_at": generated_at,
+        }
+
+    def get_credential_or_404(
+        credential_id: str, case_id: str | None = None
+    ) -> sqlite3.Row:
+        db = get_db()
+        if case_id is None:
+            row = db.execute(
+                "SELECT * FROM credentials WHERE id = ?", (credential_id,)
+            ).fetchone()
+        else:
+            row = db.execute(
+                "SELECT * FROM credentials WHERE id = ? AND case_id = ?",
+                (credential_id, case_id),
+            ).fetchone()
+        if row is None:
+            abort(404)
+        return row
+
     @app.get("/health")
     def health():
         return jsonify(status="ok")
@@ -550,13 +699,120 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if detail is None:
             abort(404)
         added = request.args.get("added") == "1"
+        created_credential = request.args.get("credential")
+        credential_failed = request.args.get("credential_error") == "1"
         return render_template(
             "case.html",
             **detail,
             error_message=None,
             conflict=False,
             added=added,
+            created_credential=created_credential,
+            credential_failed=credential_failed,
         )
+
+    @app.post("/cases/<case_id>/credentials")
+    def create_credential_html(case_id: str):
+        if not case_exists(case_id):
+            abort(404)
+        try:
+            credential = create_credential_service(case_id)
+        except VerificationError as exc:
+            detail = get_detail(case_id)
+            return (
+                render_template(
+                    "case.html",
+                    **detail,
+                    error_message=str(exc),
+                    conflict=False,
+                    added=False,
+                    created_credential=None,
+                    credential_failed=True,
+                ),
+                400,
+            )
+        except (EvidenceError, sqlite3.Error, OSError) as exc:
+            # The service already rolled the snapshot transaction back.
+            detail = get_detail(case_id)
+            return (
+                render_template(
+                    "case.html",
+                    **detail,
+                    error_message=f"凭据打包或写入失败：{exc}",
+                    conflict=False,
+                    added=False,
+                    created_credential=None,
+                    credential_failed=True,
+                ),
+                500,
+            )
+        return redirect(
+            url_for(
+                "case_detail",
+                case_id=case_id,
+                credential=credential["id"],
+            ),
+            code=303,
+        )
+
+    @app.get("/cases/<case_id>/credentials/<credential_id>/download")
+    def download_credential_html(case_id: str, credential_id: str):
+        if not case_exists(case_id):
+            abort(404)
+        row = get_credential_or_404(credential_id, case_id)
+        return send_file(
+            io.BytesIO(row["bundle_blob"]),
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=f"{credential_id}.zip",
+        )
+
+    @app.post("/api/cases/<case_id>/credentials")
+    def create_credential_api(case_id: str):
+        if not case_exists(case_id):
+            return jsonify(error="案例不存在"), 404
+        try:
+            credential = create_credential_service(case_id)
+        except VerificationError as exc:
+            return jsonify(error=str(exc), rejected=True), 400
+        except (EvidenceError, sqlite3.Error, OSError) as exc:
+            # Packaging or write failure: the snapshot transaction was rolled
+            # back, so no half package or credential row remains.
+            return jsonify(error=str(exc), rejected=True), 500
+        return jsonify(credential), 201
+
+    @app.get("/api/cases/<case_id>/credentials")
+    def list_credentials_api(case_id: str):
+        if not case_exists(case_id):
+            return jsonify(error="案例不存在"), 404
+        return jsonify(credentials=list_credentials(case_id))
+
+    @app.get("/api/credentials/<credential_id>")
+    def credential_detail_api(credential_id: str):
+        row = get_credential_or_404(credential_id)
+        return jsonify(
+            {
+                "id": row["id"],
+                "case_id": row["case_id"],
+                "conclusion_id": row["conclusion_id"],
+                "package_sha256": row["package_sha256"],
+                "manifest_sha256": row["manifest_sha256"],
+                "created_at": row["created_at"],
+            }
+        )
+
+    @app.get("/api/credentials/<credential_id>/download")
+    def download_credential_api(credential_id: str):
+        row = get_credential_or_404(credential_id)
+        response = send_file(
+            io.BytesIO(row["bundle_blob"]),
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=f"{credential_id}.zip",
+        )
+        response.headers["X-Credential-Id"] = row["id"]
+        response.headers["X-Credential-SHA256"] = row["package_sha256"]
+        return response
 
     @app.post("/cases/<case_id>/supplements")
     def add_supplement_html(case_id: str):

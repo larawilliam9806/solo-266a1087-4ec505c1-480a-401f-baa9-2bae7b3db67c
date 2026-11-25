@@ -22,7 +22,23 @@
   补记已保存，系统已重新判定并写入新结论。
 </div>
 {% endif %}
-{% if error_message %}
+{% if created_credential %}
+<div class="alert alert-success" role="status" data-testid="credential-saved">
+  <strong>核查凭据已生成：</strong>
+  <span class="mono" data-testid="created-credential-id">{{ created_credential }}</span>
+  <div>
+    原始两份 CSV、已接受补记与当时结论版本已冻结为同一 SQLite 快照，
+    <a href="{{ url_for('download_credential_html', case_id=case.id, credential_id=created_credential) }}">立即下载凭据 ZIP</a>。
+  </div>
+</div>
+{% endif %}
+{% if credential_failed %}
+<div class="alert alert-error" role="alert" data-testid="credential-error">
+  <strong>凭据生成失败：</strong>{{ error_message }}
+  <div>本次生成已整体回滚，未留下任何半包或凭据记录。</div>
+</div>
+{% endif %}
+{% if error_message and not credential_failed %}
 <div class="alert alert-error" role="alert" data-testid="conflict-message" data-conflict="{{ 'true' if conflict else 'false' }}">
   <strong>补记被退回：</strong>{{ error_message }}
   <div>已有补记和当前结论均保持不变。</div>
@@ -116,6 +132,49 @@
   </article>
 </section>
 {% endif %}
+
+<section class="card credential-card" id="credential-card">
+  <div class="card-head">
+    <h2>核查凭据（快照下载）</h2>
+    <span class="pill">同一 SQLite 事务冻结 · 后续结论不改写旧包</span>
+  </div>
+  <p class="muted credential-intro">
+    生成时会在同一 SQLite 快照中保存原始两份 CSV、当时已接受的补记、当前结论版本，
+    以及按文件名字段排序的 SHA-256 清单，打包为 ZIP 返回凭据编号。
+    生成期间若有补记提交，或打包、写入失败，整体回滚，不会留下半包。
+  </p>
+  <form method="post" action="{{ url_for('create_credential_html', case_id=case.id) }}" id="credential-form">
+    <button class="btn btn-primary" type="submit" data-testid="generate-credential">
+      生成核查凭据
+    </button>
+  </form>
+
+  <div class="credential-list">
+    <h3>已生成凭据（{{ credentials | length }}）</h3>
+    {% if credentials %}
+    <ul id="credentials" data-testid="credential-list">
+      {% for item in credentials %}
+      <li class="credential-item" data-testid="credential-item">
+        <div class="credential-main">
+          <span class="mono credential-id" data-testid="credential-id">{{ item.id }}</span>
+          <span class="pill">结论编号 #{{ item.conclusion_id }}</span>
+          <time class="muted">{{ item.created_at }} UTC</time>
+        </div>
+        <div class="credential-hashes mono" data-testid="credential-hashes">
+          <span>整包 SHA-256：<strong data-testid="package-sha256">{{ item.package_sha256 }}</strong></span>
+          <span>清单 SHA-256：<strong data-testid="manifest-sha256">{{ item.manifest_sha256 }}</strong></span>
+        </div>
+        <a class="btn btn-small"
+           href="{{ url_for('download_credential_html', case_id=case.id, credential_id=item.id) }}"
+           data-testid="credential-download">下载原始快照 ZIP</a>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty" id="no-credentials">尚未生成凭据；凭据一旦生成即不可变，案例出现新结论也不会改写旧包。</p>
+    {% endif %}
+  </div>
+</section>
 
 <section class="card supplement-card" id="supplement-form-card">
   <div class="card-head">

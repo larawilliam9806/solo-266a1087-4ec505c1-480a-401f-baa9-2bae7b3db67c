@@ -8,6 +8,8 @@
 
 支持在页面上补记一条**跨表记录先后关系**后重新判定。补记与分钟、行序或已有补记冲突时返回 `409`/页面错误，不写入冲突补记，原有补记和当前结论保持不变。
 
+案例页还可以为登记员生成**核查凭据**：在同一个 SQLite 快照事务中冻结原始两份 CSV、当时已接受的补记、当前结论版本以及按文件名字段排序的 SHA-256 清单，打成 ZIP 返回凭据编号。凭据一经生成即不可变，之后案例出现新结论也不会改写旧包；生成期间若有补记提交，或打包、写入失败，整个事务回滚，不留下半包。
+
 ## 启动
 
 ```bash
@@ -137,12 +139,57 @@ curl -i -X POST "http://localhost:5000/api/cases/$CID/supplements" \
 
 普通 HTML 提交地址为 `POST /cases/<case_id>/supplements`。
 
+### 生成与下载核查凭据
+
+```bash
+# 生成（同一 SQLite 快照事务，返回凭据编号和校验摘要）
+curl -sS -X POST "http://localhost:5000/api/cases/$CID/credentials"
+# {
+#   "id": "CR-20261125-104EDD70",
+#   "case_id": "...",
+#   "conclusion_id": 1,
+#   "package_sha256": "4e6764...",
+#   "manifest_sha256": "3c16ed...",
+#   "created_at": "2026-11-25T00:08:38+00:00"
+# }
+
+# 按凭据编号下载当时冻结的原始快照（与页面生成时间无关，始终返回旧包）
+curl -OJ "http://localhost:5000/api/credentials/CR-20261125-104EDD70/download"
+```
+
+ZIP 内固定包含五个条目（顺序固定、时间戳固定，可重复构建出相同字节）：
+
+| 条目 | 内容 |
+|---|---|
+| `warehouse.csv` | 快照时的原始库房 CSV（UTF-8） |
+| `qc.csv` | 快照时的原始质检 CSV（UTF-8） |
+| `supplements.json` | 快照时已接受的全部补记及来源文件名 |
+| `conclusion.json` | 快照时的结论版本（含结论编号、判定与见证顺序） |
+| `MANIFEST.sha256` | 前四个文件按文件名字段排序的 SHA-256 清单 |
+
+可直接用系统工具复核：
+
+```bash
+unzip -p CR-20261125-104EDD70.zip MANIFEST.sha256 \
+  | (cd "$(mktemp -d)" && unzip -q - && sha256sum -c MANIFEST.sha256)
+```
+
+其他凭据接口：
+
+- `GET /api/cases/<case_id>/credentials`：列出该案例全部凭据的元数据（不含 ZIP 本体）；
+- `GET /api/credentials/<credential_id>`：按编号查询单个凭据的结论编号与校验摘要；
+- 页面表单地址为 `POST /cases/<case_id>/credentials`，下载地址为
+  `GET /cases/<case_id>/credentials/<credential_id>/download`。
+
+生成失败（打包异常或数据库写入异常）返回 `500` 且事务整体回滚，`credentials` 表不会出现半包记录；案例不存在时返回 `404`。
+
 ## SQLite 表
 
 - `cases`：箱号、原始 CSV 文本、当前结论指针；
 - `records`：解析后的流水、表别、记录号、分钟键、行序、动作类型；
 - `supplements`：已接受的跨表先后补记；
-- `conclusions`：初次上传及每次成功补记后的结论 JSON 历史。
+- `conclusions`：初次上传及每次成功补记后的结论 JSON 历史；
+- `credentials`：不可变凭据，保存结论编号、整包与清单 SHA-256、清单文本和 ZIP 二进制（`bundle_blob`），仅追加、不更新不删除。
 
 ## 测试
 
@@ -150,18 +197,21 @@ curl -i -X POST "http://localhost:5000/api/cases/$CID/supplements" \
 python tests/test_algorithm_exhaustive.py   # 与全排列暴力判定随机对照
 python tests/test_performance.py            # 320 条同分钟记录性能检查
 python tests/test_app.py                    # Flask/SQLite/冲突退回测试（需安装 Flask）
+python tests/test_evidence.py               # 凭据打包、清单排序、防篡改与可重复构建
+python tests/test_credentials.py            # 凭据生成/下载/不可变/失败回滚/并发快照（需安装 Flask）
 ```
 
 ## 目录
 
 ```text
-app.py          Flask 路由、上传、持久化与页面/API
+app.py          Flask 路由、上传、持久化、凭据事务与页面/API
 verifier.py     CSV 解析、偏序、可达性、三态判定和见证顺序
+evidence.py     凭据 ZIP 打包、固定排序 SHA-256 清单与校验
 database.py     SQLite schema/连接辅助
 templates/      服务端渲染页面
 static/style.css
 samples/        一组可直接上传的歧义样例
-tests/          算法、性能和接口测试
+tests/          算法、性能、接口与凭据测试
 Dockerfile
 compose.yaml
 docker-compose.yml

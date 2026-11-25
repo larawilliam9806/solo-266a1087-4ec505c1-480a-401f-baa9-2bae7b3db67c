@@ -105,6 +105,22 @@ def init_db() -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_conclusions_case ON conclusions(case_id);
+
+        CREATE TABLE IF NOT EXISTS credentials (
+            id TEXT PRIMARY KEY,
+            case_id TEXT NOT NULL,
+            conclusion_id INTEGER NOT NULL,
+            package_sha256 TEXT NOT NULL,
+            manifest_sha256 TEXT NOT NULL,
+            manifest_text TEXT NOT NULL,
+            bundle_blob BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(case_id) REFERENCES cases(id),
+            FOREIGN KEY(conclusion_id) REFERENCES conclusions(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_credentials_case
+            ON credentials(case_id, created_at, id);
         """
     )
     db.commit()
